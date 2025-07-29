@@ -1,6 +1,6 @@
-# Git Change Validator Application
+# Change Validator Application
 
-A comprehensive web application for validating and integrating Git changes through an automated workflow involving LDAP authentication, CSV file validation, and Jenkins integration.
+A comprehensive web application for validating and integrating Git changes through an automated workflow CSV file validation, and Jenkins integration.
 
 ## Architecture Overview
 

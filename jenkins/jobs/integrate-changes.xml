@@ -1,0 +1,238 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<project>
+  <actions/>
+  <description>Integrate validated CSV changes into the main repository</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.model.StringParameterDefinition>
+          <name>TASK_ID</name>
+          <description>Validation task ID from Supabase</description>
+          <defaultValue></defaultValue>
+          <trim>true</trim>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.FileParameterDefinition>
+          <name>validated.csv</name>
+          <description>Validated CSV file to integrate</description>
+        </hudson.model.FileParameterDefinition>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+  </properties>
+  <scm class="hudson.plugins.git.GitSCM" plugin="git@4.8.3">
+    <configVersion>2</configVersion>
+    <userRemoteConfigs>
+      <hudson.plugins.git.UserRemoteConfig>
+        <url>${GIT_REPOSITORY_URL}</url>
+        <credentialsId>${GIT_CREDENTIALS_ID}</credentialsId>
+      </hudson.plugins.git.UserRemoteConfig>
+    </userRemoteConfigs>
+    <branches>
+      <hudson.plugins.git.BranchSpec>
+        <name>*/main</name>
+      </hudson.plugins.git.BranchSpec>
+    </branches>
+    <doGenerateSubmoduleConfigurations>false</doGenerateSubmoduleConfigurations>
+    <submoduleCfg class="list"/>
+    <extensions/>
+  </scm>
+  <builders>
+    <hudson.tasks.Shell>
+      <command>#!/bin/bash
+set -e
+
+echo "=== Git Change Validator - Integration ==="
+echo "Task ID: ${TASK_ID}"
+echo "Build Number: ${BUILD_NUMBER}"
+echo "Validated file: validated.csv"
+echo "========================================"
+
+# Verify the validated file exists
+if [ ! -f "validated.csv" ]; then
+    echo "ERROR: validated.csv file not found!"
+    exit 1
+fi
+
+echo "Validated file size: $(stat -c%s validated.csv) bytes"
+echo "Validated file lines: $(wc -l < validated.csv)"
+
+# Validate CSV format
+echo "Validating CSV format..."
+if ! head -1 validated.csv | grep -q ","; then
+    echo "ERROR: File does not appear to be a valid CSV (no commas found in header)"
+    exit 1
+fi
+
+# Get task information from Supabase
+echo "Fetching task information from Supabase..."
+TASK_INFO=$(curl -s -X GET \
+  "${SUPABASE_URL}/rest/v1/validation_tasks?id=eq.${TASK_ID}&select=*" \
+  -H "apikey: ${SUPABASE_ANON_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+
+if [ -z "$TASK_INFO" ] || [ "$TASK_INFO" = "[]" ]; then
+    echo "ERROR: Task not found in Supabase"
+    exit 1
+fi
+
+echo "Task information retrieved successfully"
+
+# Extract git branch and target file path from task info
+GIT_BRANCH=$(echo "$TASK_INFO" | jq -r '.[0].git_branch')
+TARGET_FILE=$(echo "$TASK_INFO" | jq -r '.[0].diff_file_name' | sed 's/-diff\.csv$/.csv/')
+
+echo "Target branch: $GIT_BRANCH"
+echo "Target file: $TARGET_FILE"
+
+# Create a new branch for integration
+INTEGRATION_BRANCH="integration/task-${TASK_ID}-$(date +%s)"
+echo "Creating integration branch: $INTEGRATION_BRANCH"
+
+git checkout -b "$INTEGRATION_BRANCH"
+
+# Copy validated file to target location
+echo "Copying validated file to target location..."
+cp validated.csv "$TARGET_FILE"
+
+# Validate that the file was copied correctly
+if [ ! -f "$TARGET_FILE" ]; then
+    echo "ERROR: Failed to copy validated file to target location"
+    exit 1
+fi
+
+echo "File copied successfully"
+
+# Add and commit changes
+git add "$TARGET_FILE"
+git config user.email "jenkins@company.com"
+git config user.name "Jenkins Automation"
+
+COMMIT_MESSAGE="Integrate validated changes for task ${TASK_ID}
+
+- Validated CSV file: $(basename $TARGET_FILE)
+- Original branch: $GIT_BRANCH
+- Task ID: $TASK_ID
+- Build: ${BUILD_NUMBER}
+
+[automated commit]"
+
+git commit -m "$COMMIT_MESSAGE"
+
+# Push the integration branch
+echo "Pushing integration branch..."
+git push origin "$INTEGRATION_BRANCH"
+
+INTEGRATION_COMMIT=$(git rev-parse HEAD)
+echo "Integration commit: $INTEGRATION_COMMIT"
+
+# Create a pull request (if using GitHub/GitLab)
+# This would depend on your Git hosting solution
+echo "Integration branch created successfully: $INTEGRATION_BRANCH"
+echo "Manual review and merge to main branch required"
+
+# Generate integration report
+cat > integration_report.json << EOF
+{
+  "task_id": "${TASK_ID}",
+  "integration_branch": "${INTEGRATION_BRANCH}",
+  "integration_commit": "${INTEGRATION_COMMIT}",
+  "target_file": "${TARGET_FILE}",
+  "original_branch": "${GIT_BRANCH}",
+  "build_number": "${BUILD_NUMBER}",
+  "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "jenkins_build_url": "${BUILD_URL}",
+  "status": "SUCCESS",
+  "next_steps": "Manual review and merge required"
+}
+EOF
+
+echo "=== Integration Report ==="
+cat integration_report.json
+
+echo "=== Integration completed successfully ==="
+</command>
+    </hudson.tasks.Shell>
+  </builders>
+  <publishers>
+    <hudson.tasks.ArtifactArchiver>
+      <artifacts>integration_report.json,validated.csv</artifacts>
+      <allowEmptyArchive>false</allowEmptyArchive>
+      <onlyIfSuccessful>true</onlyIfSuccessful>
+      <fingerprint>false</fingerprint>
+      <defaultExcludes>true</defaultExcludes>
+      <caseSensitive>true</caseSensitive>
+      <followSymlinks>false</followSymlinks>
+    </hudson.tasks.ArtifactArchiver>
+    <org.jenkinsci.plugins.postbuildscript.PostBuildScript plugin="postbuildscript@2.11.0">
+      <config>
+        <scriptFiles/>
+        <groovyScripts/>
+        <buildSteps>
+          <hudson.tasks.Shell>
+            <command>#!/bin/bash
+# Webhook notification to Supabase
+WEBHOOK_URL="${SUPABASE_URL}/functions/v1/jenkins-webhook"
+JOB_STATUS="SUCCESS"
+ERROR_MESSAGE=""
+ERROR_FILE_URL=""
+
+if [ "${BUILD_RESULT}" = "FAILURE" ]; then
+    JOB_STATUS="FAILURE"
+    ERROR_MESSAGE="Integration job failed. Check Jenkins logs for details."
+    ERROR_FILE_URL="${BUILD_URL}consoleText"
+fi
+
+# Prepare artifacts URLs
+REPORT_URL="${BUILD_URL}artifact/integration_report.json"
+
+# Send webhook notification
+curl -X POST "${WEBHOOK_URL}" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -d "{
+    \"jobId\": \"${BUILD_NUMBER}\",
+    \"status\": \"${JOB_STATUS}\",
+    \"taskId\": \"${TASK_ID}\",
+    \"artifacts\": {
+      \"reportUrl\": \"${REPORT_URL}\",
+      \"errorMessage\": \"${ERROR_MESSAGE}\",
+      \"errorFileUrl\": \"${ERROR_FILE_URL}\"
+    }
+  }"
+
+echo "Webhook notification sent: ${JOB_STATUS}"
+
+# Update Supabase task status
+if [ "${JOB_STATUS}" = "SUCCESS" ]; then
+    INTEGRATION_RESULT="SUCCESS"
+    TASK_STATUS="INTEGRATED"
+else
+    INTEGRATION_RESULT="FAILURE"
+    TASK_STATUS="ERROR"
+fi
+
+curl -X PATCH \
+  "${SUPABASE_URL}/rest/v1/validation_tasks?id=eq.${TASK_ID}" \
+  -H "apikey: ${SUPABASE_ANON_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"status\": \"${TASK_STATUS}\",
+    \"integration_result\": \"${INTEGRATION_RESULT}\",
+    \"integration_completed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+    \"error_message\": \"${ERROR_MESSAGE}\",
+    \"error_file_link\": \"${ERROR_FILE_URL}\"
+  }"
+
+echo "Task status updated in Supabase: ${TASK_STATUS}"
+</command>
+          </hudson.tasks.Shell>
+        </buildSteps>
+        <scriptOnlyIfSuccess>false</scriptOnlyIfSuccess>
+        <scriptOnlyIfFailure>false</scriptOnlyIfFailure>
+        <markBuildUnstable>false</markBuildUnstable>
+      </config>
+    </org.jenkinsci.plugins.postbuildscript.PostBuildScript>
+  </publishers>
+  <buildWrappers/>
+</project>

@@ -1,0 +1,190 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<project>
+  <actions/>
+  <description>Generate diff file for Git change validation</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.model.StringParameterDefinition>
+          <name>GIT_BRANCH</name>
+          <description>Git branch to generate diff for</description>
+          <defaultValue></defaultValue>
+          <trim>true</trim>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>REFERENCE_COMMIT_HASH</name>
+          <description>Reference commit hash to compare against (optional)</description>
+          <defaultValue>origin/main</defaultValue>
+          <trim>true</trim>
+        </hudson.model.StringParameterDefinition>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+  </properties>
+  <scm class="hudson.plugins.git.GitSCM" plugin="git@4.8.3">
+    <configVersion>2</configVersion>
+    <userRemoteConfigs>
+      <hudson.plugins.git.UserRemoteConfig>
+        <url>${GIT_REPOSITORY_URL}</url>
+        <credentialsId>${GIT_CREDENTIALS_ID}</credentialsId>
+      </hudson.plugins.git.UserRemoteConfig>
+    </userRemoteConfigs>
+    <branches>
+      <hudson.plugins.git.BranchSpec>
+        <name>*/${GIT_BRANCH}</name>
+      </hudson.plugins.git.BranchSpec>
+    </branches>
+    <doGenerateSubmoduleConfigurations>false</doGenerateSubmoduleConfigurations>
+    <submoduleCfg class="list"/>
+    <extensions/>
+  </scm>
+  <builders>
+    <hudson.tasks.Shell>
+      <command>#!/bin/bash
+set -e
+
+echo "=== Git Change Validator - Diff Generation ==="
+echo "Branch: ${GIT_BRANCH}"
+echo "Reference: ${REFERENCE_COMMIT_HASH}"
+echo "Build Number: ${BUILD_NUMBER}"
+echo "========================================"
+
+# Get current commit hash
+CURRENT_COMMIT=$(git rev-parse HEAD)
+echo "Current commit: ${CURRENT_COMMIT}"
+
+# Set reference commit (default to main if not specified)
+if [ -z "${REFERENCE_COMMIT_HASH}" ] || [ "${REFERENCE_COMMIT_HASH}" == "origin/main" ]; then
+    REFERENCE_COMMIT=$(git rev-parse origin/main)
+else
+    REFERENCE_COMMIT=${REFERENCE_COMMIT_HASH}
+fi
+echo "Reference commit: ${REFERENCE_COMMIT}"
+
+# Generate diff for CSV files only
+echo "Generating diff for CSV files..."
+git diff --name-only ${REFERENCE_COMMIT}..${CURRENT_COMMIT} -- "*.csv" > changed_files.txt
+
+if [ ! -s changed_files.txt ]; then
+    echo "No CSV files changed between ${REFERENCE_COMMIT} and ${CURRENT_COMMIT}"
+    echo "file,status,lines_added,lines_removed" > diff.csv
+    echo "No changes detected in CSV files" > metadata.json
+else
+    echo "Changed CSV files:"
+    cat changed_files.txt
+    
+    # Generate detailed diff for each CSV file
+    echo "file,status,lines_added,lines_removed,diff_content" > diff.csv
+    
+    while IFS= read -r file; do
+        if [ -f "${file}" ]; then
+            # Check if file was added, modified, or deleted
+            if git show ${REFERENCE_COMMIT}:${file} >/dev/null 2>&1; then
+                if [ -f "${file}" ]; then
+                    status="modified"
+                else
+                    status="deleted"
+                fi
+            else
+                status="added"
+            fi
+            
+            # Get diff stats
+            LINES_ADDED=$(git diff --numstat ${REFERENCE_COMMIT}..${CURRENT_COMMIT} -- "${file}" | cut -f1)
+            LINES_REMOVED=$(git diff --numstat ${REFERENCE_COMMIT}..${CURRENT_COMMIT} -- "${file}" | cut -f2)
+            
+            # Get actual diff content (escaped for CSV)
+            DIFF_CONTENT=$(git diff ${REFERENCE_COMMIT}..${CURRENT_COMMIT} -- "${file}" | sed 's/"/"""/g' | tr '\n' '|')
+            
+            echo "\"${file}\",\"${status}\",\"${LINES_ADDED}\",\"${LINES_REMOVED}\",\"${DIFF_CONTENT}\"" >> diff.csv
+        fi
+    done < changed_files.txt
+fi
+
+# Generate metadata
+cat > metadata.json << EOF
+{
+  "current_commit_hash": "${CURRENT_COMMIT}",
+  "reference_commit_hash": "${REFERENCE_COMMIT}",
+  "git_branch": "${GIT_BRANCH}",
+  "build_number": "${BUILD_NUMBER}",
+  "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "jenkins_build_url": "${BUILD_URL}",
+  "changed_files_count": $(wc -l < changed_files.txt)
+}
+EOF
+
+echo "Generated files:"
+echo "- diff.csv ($(wc -l < diff.csv) lines)"
+echo "- metadata.json"
+
+# Display first few lines of diff for verification
+echo "=== First 5 lines of diff.csv ==="
+head -5 diff.csv
+
+echo "=== Metadata ==="
+cat metadata.json
+</command>
+    </hudson.tasks.Shell>
+  </builders>
+  <publishers>
+    <hudson.tasks.ArtifactArchiver>
+      <artifacts>diff.csv,metadata.json,changed_files.txt</artifacts>
+      <allowEmptyArchive>false</allowEmptyArchive>
+      <onlyIfSuccessful>true</onlyIfSuccessful>
+      <fingerprint>false</fingerprint>
+      <defaultExcludes>true</defaultExcludes>
+      <caseSensitive>true</caseSensitive>
+      <followSymlinks>false</followSymlinks>
+    </hudson.tasks.ArtifactArchiver>
+    <org.jenkinsci.plugins.postbuildscript.PostBuildScript plugin="postbuildscript@2.11.0">
+      <config>
+        <scriptFiles/>
+        <groovyScripts/>
+        <buildSteps>
+          <hudson.tasks.Shell>
+            <command>#!/bin/bash
+# Webhook notification to Supabase
+WEBHOOK_URL="${SUPABASE_URL}/functions/v1/jenkins-webhook"
+JOB_STATUS="SUCCESS"
+
+if [ "${BUILD_RESULT}" = "FAILURE" ]; then
+    JOB_STATUS="FAILURE"
+fi
+
+# Prepare artifacts URLs
+DIFF_URL="${BUILD_URL}artifact/diff.csv"
+METADATA_URL="${BUILD_URL}artifact/metadata.json"
+
+# Get current commit hash from metadata if available
+CURRENT_COMMIT=""
+if [ -f "metadata.json" ]; then
+    CURRENT_COMMIT=$(grep -o '"current_commit_hash": "[^"]*"' metadata.json | cut -d'"' -f4)
+fi
+
+# Send webhook notification
+curl -X POST "${WEBHOOK_URL}" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -d "{
+    \"jobId\": \"${BUILD_NUMBER}\",
+    \"status\": \"${JOB_STATUS}\",
+    \"artifacts\": {
+      \"diffUrl\": \"${DIFF_URL}\",
+      \"metadataUrl\": \"${METADATA_URL}\",
+      \"currentCommitHash\": \"${CURRENT_COMMIT}\"
+    }
+  }"
+
+echo "Webhook notification sent: ${JOB_STATUS}"
+</command>
+          </hudson.tasks.Shell>
+        </buildSteps>
+        <scriptOnlyIfSuccess>false</scriptOnlyIfSuccess>
+        <scriptOnlyIfFailure>false</scriptOnlyIfFailure>
+        <markBuildUnstable>false</markBuildUnstable>
+      </config>
+    </org.jenkinsci.plugins.postbuildscript.PostBuildScript>
+  </publishers>
+  <buildWrappers/>
+</project>
